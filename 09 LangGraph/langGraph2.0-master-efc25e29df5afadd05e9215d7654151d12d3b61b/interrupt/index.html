@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LangGraph 中断与恢复演示</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: white; text-align: center; margin-bottom: 30px; font-size: 2em; }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        .card h2 { color: #333; margin-bottom: 16px; font-size: 1.2em; }
+        .form-group { margin-bottom: 16px; }
+        label { display: block; margin-bottom: 6px; color: #555; font-weight: 500; }
+        input[type="text"], textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        input[type="text"]:focus, textarea:focus { outline: none; border-color: #667eea; }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        .btn-primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-group { display: flex; gap: 12px; }
+        #timeline {
+            border-left: 3px solid #e0e0e0;
+            padding-left: 20px;
+            margin-left: 10px;
+            margin-top: 20px;
+        }
+        .timeline-item {
+            position: relative;
+            padding: 16px;
+            margin-bottom: 16px;
+            border-radius: 8px;
+            background: #f8f9fa;
+        }
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: -28px;
+            top: 20px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #667eea;
+        }
+        .message-role { font-weight: 600; margin-bottom: 4px; }
+        .message-role.human { color: #667eea; }
+        .message-role.ai { color: #28a745; }
+        .message-content { color: #333; line-height: 1.6; }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .status-badge.waiting { background: #f8d7da; color: #721c24; }
+        .status-badge.completed { background: #d4edda; color: #155724; }
+        .approval-section {
+            background: linear-gradient(135deg, #fff3cd 0%, #ffeeba 100%);
+            border: 2px solid #ffc107;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 16px;
+        }
+        .approval-section h3 { color: #856404; margin-bottom: 12px; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>LangGraph 中断与恢复演示</h1>
+
+        <div class="card">
+            <h2>流程说明</h2>
+            <p style="color: #666; line-height: 1.8;">
+                1. 提交任务 -> 2. 处理任务 -> 3. <strong>等待审批 (中断)</strong> -> 4. 用户确认 -> 5. 完成<br><br>
+                当任务 ID 包含 "need_approval" 时，流程会在审批节点暂停，等待人工确认后恢复执行。
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>提交新任务</h2>
+            <div class="form-group">
+                <label>任务 ID（包含 "need_approval" 需要审批）</label>
+                <input type="text" id="taskId" value="task-need_approval-001">
+            </div>
+            <div class="form-group">
+                <label>任务内容</label>
+                <input type="text" id="taskContent" value="请帮我审批这笔报销申请，金额：5000元">
+            </div>
+            <button class="btn btn-primary" onclick="startTask()">启动任务流程</button>
+        </div>
+
+        <div id="statusSection" class="card hidden">
+            <h2>执行状态: <span id="statusBadge" class="status-badge"></span></h2>
+            <p id="statusMessage" style="color: #666; margin-bottom: 16px;"></p>
+
+            <div id="approvalSection" class="approval-section hidden">
+                <h3>需要人工审批</h3>
+                <p id="approvalMessage"></p>
+                <div class="form-group">
+                    <label>拒绝原因（可选）</label>
+                    <textarea id="rejectReason" placeholder="如果拒绝，请填写原因..."></textarea>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-success" onclick="approve(true)">确认通过</button>
+                    <button class="btn btn-danger" onclick="approve(false)">拒绝</button>
+                </div>
+            </div>
+
+            <div id="timeline"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentThreadId = null;
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatMessage(msg) {
+            const roleMap = {
+                'human': { class: 'human', label: '用户' },
+                'ai': { class: 'ai', label: 'AI' },
+                'tool': { class: 'tool', label: '工具' },
+                'system': { class: 'system', label: '系统' },
+            };
+            const role = roleMap[msg.type] || { class: '', label: msg.type };
+            return `<div class="message-role ${role.class}">${role.label}:</div><div class="message-content">${escapeHtml(msg.content)}</div>`;
+        }
+
+        async function startTask() {
+            const taskId = document.getElementById('taskId').value.trim();
+            const taskContent = document.getElementById('taskContent').value.trim();
+
+            if (!taskId || !taskContent) {
+                alert('请填写任务 ID 和内容');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/start-task', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_id: taskId, task_content: taskContent })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    currentThreadId = data.thread_id;
+                    updateStatus(data.status, data.message || '');
+                    renderMessages(data.result?.messages || []);
+
+                    if (data.status === 'waiting_approval') {
+                        showApprovalSection(taskContent);
+                    }
+                } else {
+                    alert('启动任务失败: ' + (data.error || '未知错误'));
+                }
+            } catch (error) {
+                alert('请求失败: ' + error.message);
+            }
+        }
+
+        async function approve(approved) {
+            if (!currentThreadId) return;
+
+            const reason = document.getElementById('rejectReason').value;
+            hideApprovalSection();
+
+            try {
+                const response = await fetch('/api/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        thread_id: currentThreadId,
+                        approved: approved,
+                        reason: reason
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    updateStatus('completed', '任务已完成！');
+                    appendMessages(data.result?.messages || []);
+                } else {
+                    alert('审批操作失败: ' + (data.error || '未知错误'));
+                }
+            } catch (error) {
+                alert('请求失败: ' + error.message);
+            }
+        }
+
+        function updateStatus(status, message) {
+            document.getElementById('statusSection').classList.remove('hidden');
+            const badge = document.getElementById('statusBadge');
+            const statusMap = {
+                'waiting_approval': { class: 'waiting', text: '等待审批' },
+                'completed': { class: 'completed', text: '已完成' },
+            };
+            const info = statusMap[status] || { class: '', text: status };
+            badge.className = `status-badge ${info.class}`;
+            badge.textContent = info.text;
+            document.getElementById('statusMessage').textContent = message;
+        }
+
+        function showApprovalSection(taskContent) {
+            document.getElementById('approvalMessage').textContent = '任务内容: ' + taskContent;
+            document.getElementById('approvalSection').classList.remove('hidden');
+        }
+
+        function hideApprovalSection() {
+            document.getElementById('approvalSection').classList.add('hidden');
+        }
+
+        function renderMessages(messages) {
+            document.getElementById('timeline').innerHTML = messages.map(msg =>
+                `<div class="timeline-item">${formatMessage(msg)}</div>`
+            ).join('');
+        }
+
+        function appendMessages(messages) {
+            const timeline = document.getElementById('timeline');
+            messages.forEach(msg => {
+                timeline.innerHTML += `<div class="timeline-item">${formatMessage(msg)}</div>`;
+            });
+        }
+    </script>
+</body>
+</html>
+
